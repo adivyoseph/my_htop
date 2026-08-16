@@ -230,9 +230,9 @@ static void LinuxProcess_rowWriteField(const Row* super, RichString* str, Proces
    const LinuxMachine* lhost = (const LinuxMachine*) super->host;
 
    bool coloring = host->settings->highlightMegabytes;
-   char buffer[256]; buffer[255] = '\0';
+   char buffer[UINT8_MAX + sizeof(" ")]; buffer[sizeof(buffer) - 1] = '\0';
    int attr = CRT_colors[DEFAULT_COLOR];
-   size_t n = sizeof(buffer) - 1;
+   size_t n = sizeof(buffer);
 
    switch (field) {
    case CMINFLT: Row_printCount(str, lp->cminflt, coloring); return;
@@ -270,18 +270,24 @@ static void LinuxProcess_rowWriteField(const Row* super, RichString* str, Proces
    case IO_READ_RATE:  Row_printRate(str, lp->io_rate_read_bps, coloring); return;
    case IO_WRITE_RATE: Row_printRate(str, lp->io_rate_write_bps, coloring); return;
    case IO_RATE: Row_printRate(str, LinuxProcess_totalIORate(lp), coloring); return;
-   case CGROUP:
-      xSnprintf(buffer, n, "%-*.*s ", Row_fieldWidths[CGROUP], Row_fieldWidths[CGROUP], lp->cgroup ? lp->cgroup : "N/A");
+   case CGROUP: {
+      int width = CLAMP(Row_fieldWidths[CGROUP], 0, (int)n - 2);
+      xSnprintf(buffer, n, "%-*.*s ", width, width, lp->cgroup ? lp->cgroup : "N/A");
       RichString_appendWide(str, attr, buffer);
       return;
-   case CCGROUP:
-      xSnprintf(buffer, n, "%-*.*s ", Row_fieldWidths[CCGROUP], Row_fieldWidths[CCGROUP], lp->cgroup_short ? lp->cgroup_short : (lp->cgroup ? lp->cgroup : "N/A"));
+   }
+   case CCGROUP: {
+      int width = CLAMP(Row_fieldWidths[CCGROUP], 0, (int)n - 2);
+      xSnprintf(buffer, n, "%-*.*s ", width, width, lp->cgroup_short ? lp->cgroup_short : (lp->cgroup ? lp->cgroup : "N/A"));
       RichString_appendWide(str, attr, buffer);
       return;
-   case CONTAINER:
-      xSnprintf(buffer, n, "%-*.*s ", Row_fieldWidths[CONTAINER], Row_fieldWidths[CONTAINER], lp->container_short ? lp->container_short : "N/A");
+   }
+   case CONTAINER: {
+      int width = CLAMP(Row_fieldWidths[CONTAINER], 0, (int)n - 2);
+      xSnprintf(buffer, n, "%-*.*s ", width, width, lp->container_short ? lp->container_short : "N/A");
       RichString_appendWide(str, attr, buffer);
       return;
+   }
    case OOM:
       if (lp->oom == UINT_MAX) {
          attr = CRT_colors[PROCESS_SHADOW];

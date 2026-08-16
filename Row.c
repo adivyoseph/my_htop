@@ -154,10 +154,11 @@ static const char* alignedTitleProcessField(ProcessField field, char* titleBuffe
    }
 
    if (Process_fields[field].autoWidth) {
+      int width = CLAMP(Row_fieldWidths[field], 0, (int)titleBufferSize - 2);
       if (Process_fields[field].autoTitleRightAlign)
-         xSnprintf(titleBuffer, titleBufferSize, "%*s ", Row_fieldWidths[field], title);
+         xSnprintf(titleBuffer, titleBufferSize, "%*s ", width, title);
       else
-         xSnprintf(titleBuffer, titleBufferSize, "%-*.*s ", Row_fieldWidths[field], Row_fieldWidths[field], title);
+         xSnprintf(titleBuffer, titleBufferSize, "%-*.*s ", width, width, title);
       return titleBuffer;
    }
 
