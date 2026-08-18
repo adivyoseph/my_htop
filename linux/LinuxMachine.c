@@ -921,6 +921,13 @@ static void LinuxMachine_fetchL3CacheTopology(LinuxMachine* this) {
    for (unsigned int i = 0; i <= super->existingCPUs; i++)
       cpus[i].l3CacheID = -1;
 
+   /* Raw representative CPU number (from sysfs shared_cpu_list) per CPU;
+      renumbered below into sequential IDs, since the raw number need not
+      start at 0 or be contiguous. */
+   int* rawIDs = (int*) xMallocArray(super->existingCPUs, sizeof(int));
+   for (unsigned int i = 0; i < super->existingCPUs; i++)
+      rawIDs[i] = -1;
+
    for (unsigned int i = 0; i < super->existingCPUs; i++) {
       for (unsigned int idx = 0; idx < 10; idx++) {
          char pathBuffer[96];
@@ -945,12 +952,32 @@ static void LinuxMachine_fetchL3CacheTopology(LinuxMachine* this) {
             char* endp;
             unsigned long minCpu = strtoul(buffer, &endp, 10);
             if (endp != buffer)
-               cpus[i + 1].l3CacheID = (int)minCpu;
+               rawIDs[i] = (int)minCpu;
          }
          fclose(file);
          break;
       }
    }
+
+   int nextID = 0;
+   for (unsigned int i = 0; i < super->existingCPUs; i++) {
+      if (rawIDs[i] < 0)
+         continue;
+
+      int mapped = -1;
+      for (unsigned int j = 0; j < i; j++) {
+         if (rawIDs[j] == rawIDs[i]) {
+            mapped = cpus[j + 1].l3CacheID;
+            break;
+         }
+      }
+      if (mapped < 0)
+         mapped = nextID++;
+
+      cpus[i + 1].l3CacheID = mapped;
+   }
+
+   free(rawIDs);
 }
 
 typedef struct CPUOrderEntry_ {
