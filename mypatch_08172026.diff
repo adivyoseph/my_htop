@@ -1,0 +1,545 @@
+diff --git a/CPUMeter.c b/CPUMeter.c
+index 90ec520a..fa0ed643 100644
+--- a/CPUMeter.c
++++ b/CPUMeter.c
+@@ -20,6 +20,7 @@ in the source distribution for its full text.
+ #include "Macros.h"
+ #include "Object.h"
+ #include "Platform.h"
++#include "ProvideCurses.h"
+ #include "RichString.h"
+ #include "Settings.h"
+ #include "XUtils.h"
+@@ -282,7 +283,7 @@ static void CPUMeterCommonInit(Meter* this) {
+    Meter** meters = data->meters;
+    for (unsigned int i = 0; i < count; i++) {
+       if (!meters[i])
+-         meters[i] = Meter_new(this->host, start + i + 1, (const MeterClass*) Class(CPUMeter));
++         meters[i] = Meter_new(this->host, Machine_getCPUAtDisplaySlot(this->host, start + i) + 1, (const MeterClass*) Class(CPUMeter));
+ 
+       Meter_init(meters[i]);
+    }
+@@ -301,6 +302,51 @@ static void AllCPUsMeter_updateValues(Meter* this) {
+       Meter_updateValues(meters[i]);
+ }
+ 
++// Returns the ID of the L3 cache (CCX) this meter's CPU belongs to, or -1 if unknown.
++static int CPUMeter_getL3CacheID(const Meter* meter) {
++   const Machine* host = meter->host;
++   unsigned int cpu = meter->param;
++   if (cpu == 0 || cpu > host->existingCPUs)
++      return -1;
++   return Machine_getCPUL3CacheID(host, cpu - 1);
++}
++
++// Counts how many L3-cache group boundaries appear across meters[from..to), i.e.
++// how many separator lines that column of the layout needs to draw.
++static unsigned int CPUMeterData_countL3SeparatorsInRange(Meter** meters, unsigned int from, unsigned int to) {
++   unsigned int separators = 0;
++   int prevL3 = 0;
++   bool prevKnown = false;
++   for (unsigned int i = from; i < to; i++) {
++      int l3 = CPUMeter_getL3CacheID(meters[i]);
++      if (l3 < 0) {
++         prevKnown = false;
++         continue;
++      }
++      if (!prevKnown || l3 != prevL3) {
++         separators++;
++         prevL3 = l3;
++         prevKnown = true;
++      }
++   }
++   return separators;
++}
++
++static void CPUMeter_drawL3Separator(int x, int y, int w, int l3CacheID) {
++   if (w <= 0)
++      return;
++
++   attrset(CRT_colors[METER_TEXT]);
++   mvhline(y, x, '-', w);
++
++   char label[24];
++   int labelLen = xSnprintf(label, sizeof(label), " L3:%d ", l3CacheID);
++   if (labelLen > 0 && labelLen <= w)
++      mvaddnstr(y, x + (w - labelLen) / 2, label, labelLen);
++
++   attrset(CRT_colors[RESET_COLOR]);
++}
++
+ static void CPUMeterCommonUpdateMode(Meter* this, MeterModeId mode, unsigned int ncol) {
+    /* Reinit first in case the CPU count changed since last init */
+    CPUMeterCommonInit(this);
+@@ -318,7 +364,19 @@ static void CPUMeterCommonUpdateMode(Meter* this, MeterModeId mode, unsigned int
+    }
+    int h = meters[0]->h;
+    assert(h > 0);
+-   this->h = h * ((count + ncol - 1) / ncol);
++
++   /* Each column gets one extra row per L3-cache group boundary within it.
++      Columns are sized to fit the tallest one. */
++   unsigned int nrows = (count + ncol - 1) / ncol;
++   unsigned int maxSeparators = 0;
++   for (unsigned int col = 0; col < ncol; col++) {
++      unsigned int from = col * nrows;
++      if (from >= count)
++         break;
++      unsigned int to = MINIMUM(from + nrows, count);
++      maxSeparators = MAXIMUM(maxSeparators, CPUMeterData_countL3SeparatorsInRange(meters, from, to));
++   }
++   this->h = h * (int)nrows + (int)maxSeparators;
+ }
+ 
+ static void AllCPUsMeter_done(Meter* this) {
+@@ -354,12 +412,35 @@ static void CPUMeterCommonDraw(Meter* this, int x, int y, int w, unsigned int nc
+    int colwidth = w / (int)ncol;
+    int diff = w % (int)ncol;
+    unsigned int nrows = (count + ncol - 1) / ncol;
++
++   int colY = y;
++   int prevL3 = 0;
++   bool prevKnown = false;
+    for (unsigned int i = 0; i < count; i++) {
+       unsigned int col = i / nrows;
+       int d = (int)col > diff ? diff : (int)col; // dynamic spacer
+       int xpos = x + ((int)col * colwidth) + d;
+-      int ypos = y + ((i % nrows) * meters[0]->h);
+-      meters[i]->draw(meters[i], xpos, ypos, colwidth);
++
++      if (i % nrows == 0) {
++         /* Start of a new column: reset the running Y position. */
++         colY = y;
++         prevKnown = false;
++      }
++
++      int l3 = CPUMeter_getL3CacheID(meters[i]);
++      if (l3 >= 0) {
++         if (!prevKnown || l3 != prevL3) {
++            CPUMeter_drawL3Separator(xpos, colY, colwidth, l3);
++            colY++;
++         }
++         prevL3 = l3;
++         prevKnown = true;
++      } else {
++         prevKnown = false;
++      }
++
++      meters[i]->draw(meters[i], xpos, colY, colwidth);
++      colY += meters[i]->h;
+    }
+ }
+ 
+@@ -377,14 +458,7 @@ static void OctoColCPUsMeter_draw(Meter* this, int x, int y, int w) {
+ 
+ 
+ static void SingleColCPUsMeter_draw(Meter* this, int x, int y, int w) {
+-   CPUMeterData* data = this->meterData;
+-   Meter** meters = data->meters;
+-   unsigned int start, count;
+-   AllCPUsMeter_getRange(this, &start, &count);
+-   for (unsigned int i = 0; i < count; i++) {
+-      meters[i]->draw(meters[i], x, y, w);
+-      y += meters[i]->h;
+-   }
++   CPUMeterCommonDraw(this, x, y, w, 1);
+ }
+ 
+ 
+diff --git a/Machine.h b/Machine.h
+index d7c71b94..eedfa6d2 100644
+--- a/Machine.h
++++ b/Machine.h
+@@ -87,6 +87,13 @@ int Machine_getCPUPhysicalCoreID(const Machine* this, unsigned int id);
+ 
+ int Machine_getCPUThreadIndex(const Machine* this, unsigned int id);
+ 
++/* Maps a CPU meter display slot (0-based, grouped by NUMA node then L3 cache)
++   to the underlying 0-based OS CPU index. */
++unsigned int Machine_getCPUAtDisplaySlot(const Machine* this, unsigned int slot);
++
++/* ID of the L3 cache (CCX) shared by this CPU and others, or -1 if unknown. */
++int Machine_getCPUL3CacheID(const Machine* this, unsigned int id);
++
+ void Machine_populateTablesFromSettings(Machine* this, Settings* settings, Table* processTable);
+ 
+ void Machine_setTablesPanel(Machine* this, Panel* panel);
+diff --git a/darwin/DarwinMachine.c b/darwin/DarwinMachine.c
+index c3b6f70e..f8d4a83e 100644
+--- a/darwin/DarwinMachine.c
++++ b/darwin/DarwinMachine.c
+@@ -149,3 +149,15 @@ int Machine_getCPUThreadIndex(const Machine* host, unsigned int id) {
+    (void) host; (void) id;
+    return 0;
+ }
++
++unsigned int Machine_getCPUAtDisplaySlot(const Machine* host, unsigned int slot) {
++   assert(slot < host->existingCPUs);
++   (void) host;
++   return slot;
++}
++
++int Machine_getCPUL3CacheID(const Machine* host, unsigned int id) {
++   assert(id < host->existingCPUs);
++   (void) host; (void) id;
++   return -1;
++}
+diff --git a/dragonflybsd/DragonFlyBSDMachine.c b/dragonflybsd/DragonFlyBSDMachine.c
+index 3b17a502..bd42217d 100644
+--- a/dragonflybsd/DragonFlyBSDMachine.c
++++ b/dragonflybsd/DragonFlyBSDMachine.c
+@@ -385,3 +385,15 @@ int Machine_getCPUThreadIndex(const Machine* host, unsigned int id) {
+    (void) host; (void) id;
+    return 0;
+ }
++
++unsigned int Machine_getCPUAtDisplaySlot(const Machine* host, unsigned int slot) {
++   assert(slot < host->existingCPUs);
++   (void) host;
++   return slot;
++}
++
++int Machine_getCPUL3CacheID(const Machine* host, unsigned int id) {
++   assert(id < host->existingCPUs);
++   (void) host; (void) id;
++   return -1;
++}
+diff --git a/freebsd/FreeBSDMachine.c b/freebsd/FreeBSDMachine.c
+index 61c0bb36..4bcc584c 100644
+--- a/freebsd/FreeBSDMachine.c
++++ b/freebsd/FreeBSDMachine.c
+@@ -419,3 +419,15 @@ int Machine_getCPUThreadIndex(const Machine* host, unsigned int id) {
+    (void) host; (void) id;
+    return 0;
+ }
++
++unsigned int Machine_getCPUAtDisplaySlot(const Machine* host, unsigned int slot) {
++   assert(slot < host->existingCPUs);
++   (void) host;
++   return slot;
++}
++
++int Machine_getCPUL3CacheID(const Machine* host, unsigned int id) {
++   assert(id < host->existingCPUs);
++   (void) host; (void) id;
++   return -1;
++}
+diff --git a/linux/LinuxMachine.c b/linux/LinuxMachine.c
+index 4b44c54b..3feda557 100644
+--- a/linux/LinuxMachine.c
++++ b/linux/LinuxMachine.c
+@@ -849,6 +849,153 @@ static void LinuxMachine_computeThreadIndices(LinuxMachine* this) {
+    cpus[0].threadIndex = 0;
+ }
+ 
++static void LinuxMachine_assignNUMANode(CPUData* cpus, unsigned int existingCPUs, const char* list, int nodeId) {
++   const char* p = list;
++   while (*p && *p != '\n') {
++      char* endp;
++      unsigned long start = strtoul(p, &endp, 10);
++      if (endp == p)
++         break;
++
++      unsigned long end = start;
++      p = endp;
++      if (*p == '-') {
++         p++;
++         end = strtoul(p, &endp, 10);
++         p = endp;
++      }
++
++      for (unsigned long c = start; c <= end && c < existingCPUs; c++)
++         cpus[c + 1].numaNode = nodeId;
++
++      if (*p == ',')
++         p++;
++      else
++         break;
++   }
++}
++
++static void LinuxMachine_fetchNUMATopology(LinuxMachine* this) {
++   const Machine* super = &this->super;
++   CPUData* cpus = this->cpuData;
++
++   for (unsigned int i = 0; i <= super->existingCPUs; i++)
++      cpus[i].numaNode = -1;
++
++   DIR* dir = opendir("/sys/devices/system/node");
++   if (!dir)
++      return;
++
++   const struct dirent* entry;
++   while ((entry = readdir(dir)) != NULL) {
++      if (entry->d_type != DT_DIR && entry->d_type != DT_UNKNOWN)
++         continue;
++
++      if (!String_startsWith(entry->d_name, "node"))
++         continue;
++
++      char* endp;
++      unsigned long int nodeId = strtoul(entry->d_name + 4, &endp, 10);
++      if (nodeId >= INT_MAX || endp == entry->d_name + 4 || *endp != '\0')
++         continue;
++
++      char pathBuffer[64];
++      xSnprintf(pathBuffer, sizeof(pathBuffer), "/sys/devices/system/node/%s/cpulist", entry->d_name);
++      FILE* file = fopen(pathBuffer, "r");
++      if (!file)
++         continue;
++
++      char buffer[256];
++      if (fgets(buffer, sizeof(buffer), file))
++         LinuxMachine_assignNUMANode(cpus, super->existingCPUs, buffer, (int)nodeId);
++
++      fclose(file);
++   }
++   closedir(dir);
++}
++
++static void LinuxMachine_fetchL3CacheTopology(LinuxMachine* this) {
++   const Machine* super = &this->super;
++   CPUData* cpus = this->cpuData;
++
++   for (unsigned int i = 0; i <= super->existingCPUs; i++)
++      cpus[i].l3CacheID = -1;
++
++   for (unsigned int i = 0; i < super->existingCPUs; i++) {
++      for (unsigned int idx = 0; idx < 10; idx++) {
++         char pathBuffer[96];
++         xSnprintf(pathBuffer, sizeof(pathBuffer), "/sys/devices/system/cpu/cpu%u/cache/index%u/level", i, idx);
++         FILE* file = fopen(pathBuffer, "r");
++         if (!file)
++            continue;
++
++         int level = -1;
++         int matched = fscanf(file, "%d", &level);
++         fclose(file);
++         if (matched != 1 || level != 3)
++            continue;
++
++         xSnprintf(pathBuffer, sizeof(pathBuffer), "/sys/devices/system/cpu/cpu%u/cache/index%u/shared_cpu_list", i, idx);
++         file = fopen(pathBuffer, "r");
++         if (!file)
++            break;
++
++         char buffer[256];
++         if (fgets(buffer, sizeof(buffer), file)) {
++            char* endp;
++            unsigned long minCpu = strtoul(buffer, &endp, 10);
++            if (endp != buffer)
++               cpus[i + 1].l3CacheID = (int)minCpu;
++         }
++         fclose(file);
++         break;
++      }
++   }
++}
++
++typedef struct CPUOrderEntry_ {
++   unsigned int cpu;      /* 0-based OS CPU index */
++   const CPUData* data;
++} CPUOrderEntry;
++
++static int CPUOrderEntry_compare(const void* a, const void* b) {
++   const CPUOrderEntry* ea = (const CPUOrderEntry*)a;
++   const CPUOrderEntry* eb = (const CPUOrderEntry*)b;
++
++   if (ea->data->numaNode != eb->data->numaNode)
++      return ea->data->numaNode - eb->data->numaNode;
++   if (ea->data->l3CacheID != eb->data->l3CacheID)
++      return ea->data->l3CacheID - eb->data->l3CacheID;
++   if (ea->data->coreIndex != eb->data->coreIndex)
++      return ea->data->coreIndex - eb->data->coreIndex;
++   if (ea->data->threadIndex != eb->data->threadIndex)
++      return ea->data->threadIndex - eb->data->threadIndex;
++
++   return (int)ea->cpu - (int)eb->cpu;
++}
++
++static void LinuxMachine_computeCPUDisplayOrder(LinuxMachine* this) {
++   const Machine* super = &this->super;
++   unsigned int n = super->existingCPUs;
++
++   free(this->cpuDisplayOrder);
++   this->cpuDisplayOrder = (unsigned int*) xMallocArray(n, sizeof(unsigned int));
++   this->cpuDisplayOrderCount = n;
++
++   CPUOrderEntry* entries = (CPUOrderEntry*) xMallocArray(n, sizeof(CPUOrderEntry));
++   for (unsigned int i = 0; i < n; i++) {
++      entries[i].cpu = i;
++      entries[i].data = &this->cpuData[i + 1];
++   }
++
++   qsort(entries, n, sizeof(CPUOrderEntry), CPUOrderEntry_compare);
++
++   for (unsigned int i = 0; i < n; i++)
++      this->cpuDisplayOrder[i] = entries[i].cpu;
++
++   free(entries);
++}
++
+ static void LinuxMachine_scanCPUFrequency(LinuxMachine* this) {
+    const Machine* super = &this->super;
+ 
+@@ -935,6 +1082,9 @@ Machine* Machine_new(UsersTable* usersTable, uid_t userId) {
+    #endif
+    LinuxMachine_assignCCDs(this, ccds);
+    LinuxMachine_computeThreadIndices(this);
++   LinuxMachine_fetchNUMATopology(this);
++   LinuxMachine_fetchL3CacheTopology(this);
++   LinuxMachine_computeCPUDisplayOrder(this);
+ 
+    return super;
+ }
+@@ -953,6 +1103,7 @@ void Machine_delete(Machine* super) {
+    }
+ 
+    free(this->cpuData);
++   free(this->cpuDisplayOrder);
+    free(this);
+ }
+ 
+@@ -976,3 +1127,19 @@ int Machine_getCPUThreadIndex(const Machine* super, unsigned int id) {
+    assert(id < super->existingCPUs);
+    return this->cpuData[id + 1].threadIndex;
+ }
++
++unsigned int Machine_getCPUAtDisplaySlot(const Machine* super, unsigned int slot) {
++   const LinuxMachine* this = (const LinuxMachine*) super;
++
++   if (slot < this->cpuDisplayOrderCount)
++      return this->cpuDisplayOrder[slot];
++
++   return slot;
++}
++
++int Machine_getCPUL3CacheID(const Machine* super, unsigned int id) {
++   const LinuxMachine* this = (const LinuxMachine*) super;
++
++   assert(id < super->existingCPUs);
++   return this->cpuData[id + 1].l3CacheID;
++}
+diff --git a/linux/LinuxMachine.h b/linux/LinuxMachine.h
+index efcf8f86..80c0e7b8 100644
+--- a/linux/LinuxMachine.h
++++ b/linux/LinuxMachine.h
+@@ -56,6 +56,8 @@ typedef struct CPUData_ {
+    int ccdID;           /* same for each AMD chiplet */
+    int coreIndex;       /* Normalized physical core ID */
+    int threadIndex;     /* SMT thread index: 0 for first thread, 1 for second, etc. */
++   int numaNode;        /* NUMA node ID, -1 if unknown */
++   int l3CacheID;       /* ID of the L3 cache (CCX) this CPU shares with others, -1 if unknown */
+ 
+    bool online;
+ } CPUData;
+@@ -90,6 +92,9 @@ typedef struct LinuxMachine_ {
+    int maxPhysicalID;
+    int maxCoreID;
+ 
++   unsigned int* cpuDisplayOrder;      /* OS CPU index for each display slot, grouped by NUMA node then L3 cache */
++   unsigned int cpuDisplayOrderCount;  /* number of entries in cpuDisplayOrder */
++
+    memory_t totalHugePageMem;
+    memory_t usedHugePageMem[HTOP_HUGEPAGE_COUNT];
+ 
+diff --git a/netbsd/NetBSDMachine.c b/netbsd/NetBSDMachine.c
+index e517d27f..ac725e0b 100644
+--- a/netbsd/NetBSDMachine.c
++++ b/netbsd/NetBSDMachine.c
+@@ -303,3 +303,15 @@ int Machine_getCPUThreadIndex(const Machine* host, unsigned int id) {
+    (void) host; (void) id;
+    return 0;
+ }
++
++unsigned int Machine_getCPUAtDisplaySlot(const Machine* host, unsigned int slot) {
++   assert(slot < host->existingCPUs);
++   (void) host;
++   return slot;
++}
++
++int Machine_getCPUL3CacheID(const Machine* host, unsigned int id) {
++   assert(id < host->existingCPUs);
++   (void) host; (void) id;
++   return -1;
++}
+diff --git a/openbsd/OpenBSDMachine.c b/openbsd/OpenBSDMachine.c
+index 586e47b2..16dadb54 100644
+--- a/openbsd/OpenBSDMachine.c
++++ b/openbsd/OpenBSDMachine.c
+@@ -304,3 +304,15 @@ int Machine_getCPUThreadIndex(const Machine* host, unsigned int id) {
+    (void) host; (void) id;
+    return 0;
+ }
++
++unsigned int Machine_getCPUAtDisplaySlot(const Machine* host, unsigned int slot) {
++   assert(slot < host->existingCPUs);
++   (void) host;
++   return slot;
++}
++
++int Machine_getCPUL3CacheID(const Machine* host, unsigned int id) {
++   assert(id < host->existingCPUs);
++   (void) host; (void) id;
++   return -1;
++}
+diff --git a/pcp/PCPMachine.c b/pcp/PCPMachine.c
+index 3b9aa816..a65d9fe6 100644
+--- a/pcp/PCPMachine.c
++++ b/pcp/PCPMachine.c
+@@ -428,3 +428,15 @@ int Machine_getCPUThreadIndex(const Machine* host, unsigned int id) {
+    (void) host; (void) id;
+    return 0;
+ }
++
++unsigned int Machine_getCPUAtDisplaySlot(const Machine* host, unsigned int slot) {
++   assert(slot < host->existingCPUs);
++   (void) host;
++   return slot;
++}
++
++int Machine_getCPUL3CacheID(const Machine* host, unsigned int id) {
++   assert(id < host->existingCPUs);
++   (void) host; (void) id;
++   return -1;
++}
+diff --git a/solaris/SolarisMachine.c b/solaris/SolarisMachine.c
+index 55f19781..a02c773f 100644
+--- a/solaris/SolarisMachine.c
++++ b/solaris/SolarisMachine.c
+@@ -341,3 +341,15 @@ int Machine_getCPUThreadIndex(const Machine* host, unsigned int id) {
+    (void) host; (void) id;
+    return 0;
+ }
++
++unsigned int Machine_getCPUAtDisplaySlot(const Machine* host, unsigned int slot) {
++   assert(slot < host->existingCPUs);
++   (void) host;
++   return slot;
++}
++
++int Machine_getCPUL3CacheID(const Machine* host, unsigned int id) {
++   assert(id < host->existingCPUs);
++   (void) host; (void) id;
++   return -1;
++}
+diff --git a/unsupported/UnsupportedMachine.c b/unsupported/UnsupportedMachine.c
+index f9aa9c21..316656bb 100644
+--- a/unsupported/UnsupportedMachine.c
++++ b/unsupported/UnsupportedMachine.c
+@@ -64,3 +64,15 @@ int Machine_getCPUThreadIndex(const Machine* host, unsigned int id) {
+    (void) host; (void) id;
+    return 0;
+ }
++
++unsigned int Machine_getCPUAtDisplaySlot(const Machine* host, unsigned int slot) {
++   assert(slot < host->existingCPUs);
++   (void) host;
++   return slot;
++}
++
++int Machine_getCPUL3CacheID(const Machine* host, unsigned int id) {
++   assert(id < host->existingCPUs);
++   (void) host; (void) id;
++   return -1;
++}

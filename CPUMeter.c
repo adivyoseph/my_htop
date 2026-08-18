@@ -20,6 +20,7 @@ in the source distribution for its full text.
 #include "Macros.h"
 #include "Object.h"
 #include "Platform.h"
+#include "ProvideCurses.h"
 #include "RichString.h"
 #include "Settings.h"
 #include "XUtils.h"
@@ -282,7 +283,7 @@ static void CPUMeterCommonInit(Meter* this) {
    Meter** meters = data->meters;
    for (unsigned int i = 0; i < count; i++) {
       if (!meters[i])
-         meters[i] = Meter_new(this->host, start + i + 1, (const MeterClass*) Class(CPUMeter));
+         meters[i] = Meter_new(this->host, Machine_getCPUAtDisplaySlot(this->host, start + i) + 1, (const MeterClass*) Class(CPUMeter));
 
       Meter_init(meters[i]);
    }
@@ -299,6 +300,51 @@ static void AllCPUsMeter_updateValues(Meter* this) {
    Meter** meters = data->meters;
    for (unsigned int i = 0; i < count; i++)
       Meter_updateValues(meters[i]);
+}
+
+// Returns the ID of the L3 cache (CCX) this meter's CPU belongs to, or -1 if unknown.
+static int CPUMeter_getL3CacheID(const Meter* meter) {
+   const Machine* host = meter->host;
+   unsigned int cpu = meter->param;
+   if (cpu == 0 || cpu > host->existingCPUs)
+      return -1;
+   return Machine_getCPUL3CacheID(host, cpu - 1);
+}
+
+// Counts how many L3-cache group boundaries appear across meters[from..to), i.e.
+// how many separator lines that column of the layout needs to draw.
+static unsigned int CPUMeterData_countL3SeparatorsInRange(Meter** meters, unsigned int from, unsigned int to) {
+   unsigned int separators = 0;
+   int prevL3 = 0;
+   bool prevKnown = false;
+   for (unsigned int i = from; i < to; i++) {
+      int l3 = CPUMeter_getL3CacheID(meters[i]);
+      if (l3 < 0) {
+         prevKnown = false;
+         continue;
+      }
+      if (!prevKnown || l3 != prevL3) {
+         separators++;
+         prevL3 = l3;
+         prevKnown = true;
+      }
+   }
+   return separators;
+}
+
+static void CPUMeter_drawL3Separator(int x, int y, int w, int l3CacheID) {
+   if (w <= 0)
+      return;
+
+   attrset(CRT_colors[METER_TEXT]);
+   mvhline(y, x, '-', w);
+
+   char label[24];
+   int labelLen = xSnprintf(label, sizeof(label), " L3:%d ", l3CacheID);
+   if (labelLen > 0 && labelLen <= w)
+      mvaddnstr(y, x + (w - labelLen) / 2, label, labelLen);
+
+   attrset(CRT_colors[RESET_COLOR]);
 }
 
 static void CPUMeterCommonUpdateMode(Meter* this, MeterModeId mode, unsigned int ncol) {
@@ -318,7 +364,19 @@ static void CPUMeterCommonUpdateMode(Meter* this, MeterModeId mode, unsigned int
    }
    int h = meters[0]->h;
    assert(h > 0);
-   this->h = h * ((count + ncol - 1) / ncol);
+
+   /* Each column gets one extra row per L3-cache group boundary within it.
+      Columns are sized to fit the tallest one. */
+   unsigned int nrows = (count + ncol - 1) / ncol;
+   unsigned int maxSeparators = 0;
+   for (unsigned int col = 0; col < ncol; col++) {
+      unsigned int from = col * nrows;
+      if (from >= count)
+         break;
+      unsigned int to = MINIMUM(from + nrows, count);
+      maxSeparators = MAXIMUM(maxSeparators, CPUMeterData_countL3SeparatorsInRange(meters, from, to));
+   }
+   this->h = h * (int)nrows + (int)maxSeparators;
 }
 
 static void AllCPUsMeter_done(Meter* this) {
@@ -354,12 +412,35 @@ static void CPUMeterCommonDraw(Meter* this, int x, int y, int w, unsigned int nc
    int colwidth = w / (int)ncol;
    int diff = w % (int)ncol;
    unsigned int nrows = (count + ncol - 1) / ncol;
+
+   int colY = y;
+   int prevL3 = 0;
+   bool prevKnown = false;
    for (unsigned int i = 0; i < count; i++) {
       unsigned int col = i / nrows;
       int d = (int)col > diff ? diff : (int)col; // dynamic spacer
       int xpos = x + ((int)col * colwidth) + d;
-      int ypos = y + ((i % nrows) * meters[0]->h);
-      meters[i]->draw(meters[i], xpos, ypos, colwidth);
+
+      if (i % nrows == 0) {
+         /* Start of a new column: reset the running Y position. */
+         colY = y;
+         prevKnown = false;
+      }
+
+      int l3 = CPUMeter_getL3CacheID(meters[i]);
+      if (l3 >= 0) {
+         if (!prevKnown || l3 != prevL3) {
+            CPUMeter_drawL3Separator(xpos, colY, colwidth, l3);
+            colY++;
+         }
+         prevL3 = l3;
+         prevKnown = true;
+      } else {
+         prevKnown = false;
+      }
+
+      meters[i]->draw(meters[i], xpos, colY, colwidth);
+      colY += meters[i]->h;
    }
 }
 
@@ -377,14 +458,7 @@ static void OctoColCPUsMeter_draw(Meter* this, int x, int y, int w) {
 
 
 static void SingleColCPUsMeter_draw(Meter* this, int x, int y, int w) {
-   CPUMeterData* data = this->meterData;
-   Meter** meters = data->meters;
-   unsigned int start, count;
-   AllCPUsMeter_getRange(this, &start, &count);
-   for (unsigned int i = 0; i < count; i++) {
-      meters[i]->draw(meters[i], x, y, w);
-      y += meters[i]->h;
-   }
+   CPUMeterCommonDraw(this, x, y, w, 1);
 }
 
 

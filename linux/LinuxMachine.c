@@ -849,6 +849,153 @@ static void LinuxMachine_computeThreadIndices(LinuxMachine* this) {
    cpus[0].threadIndex = 0;
 }
 
+static void LinuxMachine_assignNUMANode(CPUData* cpus, unsigned int existingCPUs, const char* list, int nodeId) {
+   const char* p = list;
+   while (*p && *p != '\n') {
+      char* endp;
+      unsigned long start = strtoul(p, &endp, 10);
+      if (endp == p)
+         break;
+
+      unsigned long end = start;
+      p = endp;
+      if (*p == '-') {
+         p++;
+         end = strtoul(p, &endp, 10);
+         p = endp;
+      }
+
+      for (unsigned long c = start; c <= end && c < existingCPUs; c++)
+         cpus[c + 1].numaNode = nodeId;
+
+      if (*p == ',')
+         p++;
+      else
+         break;
+   }
+}
+
+static void LinuxMachine_fetchNUMATopology(LinuxMachine* this) {
+   const Machine* super = &this->super;
+   CPUData* cpus = this->cpuData;
+
+   for (unsigned int i = 0; i <= super->existingCPUs; i++)
+      cpus[i].numaNode = -1;
+
+   DIR* dir = opendir("/sys/devices/system/node");
+   if (!dir)
+      return;
+
+   const struct dirent* entry;
+   while ((entry = readdir(dir)) != NULL) {
+      if (entry->d_type != DT_DIR && entry->d_type != DT_UNKNOWN)
+         continue;
+
+      if (!String_startsWith(entry->d_name, "node"))
+         continue;
+
+      char* endp;
+      unsigned long int nodeId = strtoul(entry->d_name + 4, &endp, 10);
+      if (nodeId >= INT_MAX || endp == entry->d_name + 4 || *endp != '\0')
+         continue;
+
+      char pathBuffer[64];
+      xSnprintf(pathBuffer, sizeof(pathBuffer), "/sys/devices/system/node/%s/cpulist", entry->d_name);
+      FILE* file = fopen(pathBuffer, "r");
+      if (!file)
+         continue;
+
+      char buffer[256];
+      if (fgets(buffer, sizeof(buffer), file))
+         LinuxMachine_assignNUMANode(cpus, super->existingCPUs, buffer, (int)nodeId);
+
+      fclose(file);
+   }
+   closedir(dir);
+}
+
+static void LinuxMachine_fetchL3CacheTopology(LinuxMachine* this) {
+   const Machine* super = &this->super;
+   CPUData* cpus = this->cpuData;
+
+   for (unsigned int i = 0; i <= super->existingCPUs; i++)
+      cpus[i].l3CacheID = -1;
+
+   for (unsigned int i = 0; i < super->existingCPUs; i++) {
+      for (unsigned int idx = 0; idx < 10; idx++) {
+         char pathBuffer[96];
+         xSnprintf(pathBuffer, sizeof(pathBuffer), "/sys/devices/system/cpu/cpu%u/cache/index%u/level", i, idx);
+         FILE* file = fopen(pathBuffer, "r");
+         if (!file)
+            continue;
+
+         int level = -1;
+         int matched = fscanf(file, "%d", &level);
+         fclose(file);
+         if (matched != 1 || level != 3)
+            continue;
+
+         xSnprintf(pathBuffer, sizeof(pathBuffer), "/sys/devices/system/cpu/cpu%u/cache/index%u/shared_cpu_list", i, idx);
+         file = fopen(pathBuffer, "r");
+         if (!file)
+            break;
+
+         char buffer[256];
+         if (fgets(buffer, sizeof(buffer), file)) {
+            char* endp;
+            unsigned long minCpu = strtoul(buffer, &endp, 10);
+            if (endp != buffer)
+               cpus[i + 1].l3CacheID = (int)minCpu;
+         }
+         fclose(file);
+         break;
+      }
+   }
+}
+
+typedef struct CPUOrderEntry_ {
+   unsigned int cpu;      /* 0-based OS CPU index */
+   const CPUData* data;
+} CPUOrderEntry;
+
+static int CPUOrderEntry_compare(const void* a, const void* b) {
+   const CPUOrderEntry* ea = (const CPUOrderEntry*)a;
+   const CPUOrderEntry* eb = (const CPUOrderEntry*)b;
+
+   if (ea->data->numaNode != eb->data->numaNode)
+      return ea->data->numaNode - eb->data->numaNode;
+   if (ea->data->l3CacheID != eb->data->l3CacheID)
+      return ea->data->l3CacheID - eb->data->l3CacheID;
+   if (ea->data->coreIndex != eb->data->coreIndex)
+      return ea->data->coreIndex - eb->data->coreIndex;
+   if (ea->data->threadIndex != eb->data->threadIndex)
+      return ea->data->threadIndex - eb->data->threadIndex;
+
+   return (int)ea->cpu - (int)eb->cpu;
+}
+
+static void LinuxMachine_computeCPUDisplayOrder(LinuxMachine* this) {
+   const Machine* super = &this->super;
+   unsigned int n = super->existingCPUs;
+
+   free(this->cpuDisplayOrder);
+   this->cpuDisplayOrder = (unsigned int*) xMallocArray(n, sizeof(unsigned int));
+   this->cpuDisplayOrderCount = n;
+
+   CPUOrderEntry* entries = (CPUOrderEntry*) xMallocArray(n, sizeof(CPUOrderEntry));
+   for (unsigned int i = 0; i < n; i++) {
+      entries[i].cpu = i;
+      entries[i].data = &this->cpuData[i + 1];
+   }
+
+   qsort(entries, n, sizeof(CPUOrderEntry), CPUOrderEntry_compare);
+
+   for (unsigned int i = 0; i < n; i++)
+      this->cpuDisplayOrder[i] = entries[i].cpu;
+
+   free(entries);
+}
+
 static void LinuxMachine_scanCPUFrequency(LinuxMachine* this) {
    const Machine* super = &this->super;
 
@@ -935,6 +1082,9 @@ Machine* Machine_new(UsersTable* usersTable, uid_t userId) {
    #endif
    LinuxMachine_assignCCDs(this, ccds);
    LinuxMachine_computeThreadIndices(this);
+   LinuxMachine_fetchNUMATopology(this);
+   LinuxMachine_fetchL3CacheTopology(this);
+   LinuxMachine_computeCPUDisplayOrder(this);
 
    return super;
 }
@@ -953,6 +1103,7 @@ void Machine_delete(Machine* super) {
    }
 
    free(this->cpuData);
+   free(this->cpuDisplayOrder);
    free(this);
 }
 
@@ -975,4 +1126,20 @@ int Machine_getCPUThreadIndex(const Machine* super, unsigned int id) {
 
    assert(id < super->existingCPUs);
    return this->cpuData[id + 1].threadIndex;
+}
+
+unsigned int Machine_getCPUAtDisplaySlot(const Machine* super, unsigned int slot) {
+   const LinuxMachine* this = (const LinuxMachine*) super;
+
+   if (slot < this->cpuDisplayOrderCount)
+      return this->cpuDisplayOrder[slot];
+
+   return slot;
+}
+
+int Machine_getCPUL3CacheID(const Machine* super, unsigned int id) {
+   const LinuxMachine* this = (const LinuxMachine*) super;
+
+   assert(id < super->existingCPUs);
+   return this->cpuData[id + 1].l3CacheID;
 }

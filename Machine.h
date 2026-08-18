@@ -87,6 +87,13 @@ int Machine_getCPUPhysicalCoreID(const Machine* this, unsigned int id);
 
 int Machine_getCPUThreadIndex(const Machine* this, unsigned int id);
 
+/* Maps a CPU meter display slot (0-based, grouped by NUMA node then L3 cache)
+   to the underlying 0-based OS CPU index. */
+unsigned int Machine_getCPUAtDisplaySlot(const Machine* this, unsigned int slot);
+
+/* ID of the L3 cache (CCX) shared by this CPU and others, or -1 if unknown. */
+int Machine_getCPUL3CacheID(const Machine* this, unsigned int id);
+
 void Machine_populateTablesFromSettings(Machine* this, Settings* settings, Table* processTable);
 
 void Machine_setTablesPanel(Machine* this, Panel* panel);

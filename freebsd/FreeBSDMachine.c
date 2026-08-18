@@ -419,3 +419,15 @@ int Machine_getCPUThreadIndex(const Machine* host, unsigned int id) {
    (void) host; (void) id;
    return 0;
 }
+
+unsigned int Machine_getCPUAtDisplaySlot(const Machine* host, unsigned int slot) {
+   assert(slot < host->existingCPUs);
+   (void) host;
+   return slot;
+}
+
+int Machine_getCPUL3CacheID(const Machine* host, unsigned int id) {
+   assert(id < host->existingCPUs);
+   (void) host; (void) id;
+   return -1;
+}

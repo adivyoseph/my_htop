@@ -56,6 +56,8 @@ typedef struct CPUData_ {
    int ccdID;           /* same for each AMD chiplet */
    int coreIndex;       /* Normalized physical core ID */
    int threadIndex;     /* SMT thread index: 0 for first thread, 1 for second, etc. */
+   int numaNode;        /* NUMA node ID, -1 if unknown */
+   int l3CacheID;       /* ID of the L3 cache (CCX) this CPU shares with others, -1 if unknown */
 
    bool online;
 } CPUData;
@@ -89,6 +91,9 @@ typedef struct LinuxMachine_ {
 
    int maxPhysicalID;
    int maxCoreID;
+
+   unsigned int* cpuDisplayOrder;      /* OS CPU index for each display slot, grouped by NUMA node then L3 cache */
+   unsigned int cpuDisplayOrderCount;  /* number of entries in cpuDisplayOrder */
 
    memory_t totalHugePageMem;
    memory_t usedHugePageMem[HTOP_HUGEPAGE_COUNT];
